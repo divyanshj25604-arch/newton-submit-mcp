@@ -5,36 +5,81 @@ import {
   SubmissionResponse,
   SubmissionStatus,
 } from "./types.js";
+import { getNewtonAuthHeaders, NewtonAuthInput } from "./auth.js";
 
 const DEFAULT_BASE_URL = "https://my.newtonschool.co";
 const DEFAULT_SUBMIT_POLL_ATTEMPTS = 8;
 const DEFAULT_SUBMIT_POLL_INTERVAL_MS = 1200;
+const PLAYGROUND_KIND_FALLBACKS = ["coding", "react", "frontend", "project"] as const;
 
-function getAuthHeaders() {
-  const sessionCookie = process.env.NEWTON_SESSION_COOKIE;
-  const bearer = process.env.NEWTON_AUTH_TOKEN;
+type PlaygroundKind = (typeof PLAYGROUND_KIND_FALLBACKS)[number] | string;
 
-  if (!sessionCookie && !bearer) {
-    throw new Error(
-      "Missing auth: set NEWTON_SESSION_COOKIE (e.g., 'session=...') or NEWTON_AUTH_TOKEN (Bearer token)."
-    );
+function normalizePlaygroundKind(value?: string): PlaygroundKind | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+
+  if (
+    normalized.includes("project") ||
+    normalized.includes("newton-box") ||
+    normalized.includes("newton_box") ||
+    normalized.includes("newtonbox")
+  ) {
+    return "project";
   }
+  if (normalized.includes("react")) return "react";
+  if (normalized.includes("frontend") || normalized.includes("front_end") || normalized === "fe") {
+    return "frontend";
+  }
+  if (normalized.includes("coding") || normalized.includes("dsa")) return "coding";
 
-  const headers: Record<string, string> = {};
-  if (sessionCookie) headers["Cookie"] = sessionCookie;
-  if (bearer) headers["Authorization"] = `Bearer ${bearer}`;
-  return headers;
+  const safeSlug = normalized.replace(/[^a-z0-9_-]/g, "");
+  return safeSlug || undefined;
 }
 
-function createClient(): AxiosInstance {
-  const baseURL = process.env.NEWTON_BASE_URL ?? DEFAULT_BASE_URL;
+function uniquePlaygroundKinds(values: Array<PlaygroundKind | undefined>): PlaygroundKind[] {
+  const seen = new Set<string>();
+  const result: PlaygroundKind[] = [];
+  for (const value of values) {
+    if (!value) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
+function buildPlaygroundKindCandidates(preferredKinds: Array<PlaygroundKind | undefined> = []): PlaygroundKind[] {
+  return uniquePlaygroundKinds([
+    ...preferredKinds,
+    ...PLAYGROUND_KIND_FALLBACKS,
+  ]);
+}
+
+function isPlaygroundKindMiss(err: unknown): boolean {
+  if (!axios.isAxiosError(err)) return false;
+  const status = err.response?.status;
+  return status === 404 || status === 405;
+}
+
+function normalizeBaseUrl(value?: string): string {
+  const base = (value ?? DEFAULT_BASE_URL).trim().replace(/\/+$/, "");
+  if (!base) return DEFAULT_BASE_URL;
+  if (base.endsWith("/api/v1") || base.endsWith("/api/v2")) {
+    return base.replace(/\/api\/v[0-9]+$/, "");
+  }
+  return base;
+}
+
+function createClient(auth?: NewtonAuthInput): AxiosInstance {
+  const baseURL = normalizeBaseUrl(process.env.NEWTON_BASE_URL);
 
   return axios.create({
     baseURL,
     timeout: 15000,
     headers: {
       "Content-Type": "application/json",
-      ...getAuthHeaders(),
+      ...getNewtonAuthHeaders(auth),
     },
   });
 }
@@ -62,6 +107,19 @@ function firstString(...values: unknown[]): string | undefined {
   return undefined;
 }
 
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (!value) continue;
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
+}
+
 function maybeNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim()) {
@@ -69,6 +127,28 @@ function maybeNumber(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
+}
+
+function maybeBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "1" || normalized === "yes") return true;
+    if (normalized === "false" || normalized === "0" || normalized === "no") return false;
+  }
+  return undefined;
+}
+
+function maybeJsonObject(value: string): Record<string, unknown> | undefined {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return isObject(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseProblemRef(problemId: string): {
@@ -109,23 +189,75 @@ function parseProblemRef(problemId: string): {
 }
 
 function parseSubmissionRef(submissionId: string): {
+  playgroundKind?: PlaygroundKind;
   playgroundHash: string;
   requestedSubmissionHash?: string;
 } {
-  const [playgroundHash, requestedSubmissionHash] = submissionId
+  const [playgroundRef, requestedSubmissionHash] = submissionId
     .split(":")
     .map((x) => x.trim());
 
-  if (!playgroundHash) {
+  if (!playgroundRef) {
     throw new Error(
-      "Invalid submissionId. Expected '<playgroundHash>' or '<playgroundHash>:<submissionHash>'."
+      "Invalid submissionId. Expected '<playgroundHash>' or '<playgroundHash>:<submissionHash>' (optionally '<kind>/<playgroundHash>:<submissionHash>')."
     );
   }
 
+  let playgroundKind: PlaygroundKind | undefined;
+  let playgroundHash = playgroundRef;
+  const slashIndex = playgroundRef.indexOf("/");
+  if (slashIndex > 0 && slashIndex < playgroundRef.length - 1) {
+    const maybeKind = normalizePlaygroundKind(playgroundRef.slice(0, slashIndex));
+    const hashPart = playgroundRef.slice(slashIndex + 1).trim();
+    if (maybeKind && hashPart) {
+      playgroundKind = maybeKind;
+      playgroundHash = hashPart;
+    }
+  }
+
   return {
+    playgroundKind,
     playgroundHash,
     requestedSubmissionHash: requestedSubmissionHash || undefined,
   };
+}
+
+function extractPlaygroundKindHints(source?: Record<string, unknown>): PlaygroundKind[] {
+  if (!source) return [];
+
+  const assignmentQuestion = isObject(source.assignment_question)
+    ? source.assignment_question
+    : undefined;
+  const question = isObject(assignmentQuestion?.question)
+    ? assignmentQuestion.question
+    : undefined;
+
+  return uniquePlaygroundKinds([
+    normalizePlaygroundKind(
+      firstString(
+        source.playground_type,
+        source.playground_kind,
+        source.question_type,
+        source.type,
+        source.editor_type
+      )
+    ),
+    normalizePlaygroundKind(
+      firstString(
+        assignmentQuestion?.playground_type,
+        assignmentQuestion?.playground_kind,
+        assignmentQuestion?.question_type,
+        assignmentQuestion?.type
+      )
+    ),
+    normalizePlaygroundKind(
+      firstString(
+        isObject(question) ? question.playground_type : undefined,
+        isObject(question) ? question.question_type : undefined,
+        isObject(question) ? question.type : undefined
+      )
+    ),
+  ]);
 }
 
 function toExamples(raw: unknown): Problem["examples"] {
@@ -169,7 +301,9 @@ function normalizeProblemFromPlayground(
   const title =
     firstString(
       question?.title,
+      question?.question_title,
       assignmentQuestion?.title,
+      assignmentQuestion?.question_title,
       rawPlayground.title,
       fallbackId
     ) ?? fallbackId;
@@ -178,7 +312,9 @@ function normalizeProblemFromPlayground(
     firstString(
       question?.description,
       question?.statement,
+      question?.question_text,
       assignmentQuestion?.description,
+      assignmentQuestion?.question_text,
       rawPlayground.description,
       rawPlayground.problem_statement
     ) ?? "";
@@ -229,7 +365,7 @@ function normalizeAssignmentQuestions(
       assignmentHash,
       assignmentTitle,
       questionHash,
-      questionTitle: firstString(question.title, question.name),
+      questionTitle: firstString(question.title, question.question_title, question.name),
       questionType: firstString(question.question_type, question.type),
     });
   }
@@ -269,6 +405,25 @@ function isPendingBuild(raw: Record<string, unknown>): boolean {
 function normalizeSubmissionStatus(raw: Record<string, unknown>): SubmissionStatus {
   const statusText = firstString(raw.status, raw.result, raw.build_status, raw.current_status);
   const numeric = maybeNumber(raw.status_id ?? raw.current_status);
+  const assignmentQuestionMapping = isObject(raw.assignment_course_user_question_mapping)
+    ? raw.assignment_course_user_question_mapping
+    : undefined;
+  const milestoneQuestionMapping = isObject(raw.milestone_user_question_mapping)
+    ? raw.milestone_user_question_mapping
+    : undefined;
+  const isCompleted = maybeBoolean(
+    raw.completed ??
+      assignmentQuestionMapping?.completed ??
+      milestoneQuestionMapping?.completed
+  );
+  const allTestCasesPassed = maybeBoolean(
+    raw.all_test_cases_passed ??
+      raw.allTestCasesPassed ??
+      assignmentQuestionMapping?.all_test_cases_passed ??
+      assignmentQuestionMapping?.allTestCasesPassed ??
+      milestoneQuestionMapping?.all_test_cases_passed ??
+      milestoneQuestionMapping?.allTestCasesPassed
+  );
   let normalized: SubmissionStatus["status"] = "Pending";
 
   if (numeric === 3) normalized = "Accepted";
@@ -289,6 +444,14 @@ function normalizeSubmissionStatus(raw: Record<string, unknown>): SubmissionStat
     else normalized = "Pending";
   }
 
+  if (normalized === "Pending") {
+    if (allTestCasesPassed === true || isCompleted === true) {
+      normalized = "Accepted";
+    } else if (allTestCasesPassed === false) {
+      normalized = "Wrong Answer";
+    }
+  }
+
   return {
     status: normalized,
     runtime: maybeNumber(raw.runtime ?? raw.time ?? raw.execution_time),
@@ -297,27 +460,57 @@ function normalizeSubmissionStatus(raw: Record<string, unknown>): SubmissionStat
   };
 }
 
-function buildLatestSubmissionPath(playgroundHash: string): string {
+function buildPlaygroundPath(playgroundHash: string, playgroundKind: PlaygroundKind): string {
+  return `/api/v1/playground/${encodeURIComponent(playgroundKind)}/h/${encodeURIComponent(playgroundHash)}/`;
+}
+
+function buildLatestSubmissionPath(
+  playgroundHash: string,
+  playgroundKind: PlaygroundKind
+): string {
+  const basePath = `${buildPlaygroundPath(playgroundHash, playgroundKind)}latest_submission/`;
   const username = getDefaultUsername();
   if (username) {
-    return `/api/v1/playground/coding/h/${encodeURIComponent(
-      playgroundHash
-    )}/latest_submission/?username=${encodeURIComponent(username)}`;
+    return `${basePath}?username=${encodeURIComponent(username)}`;
   }
-  return `/api/v1/playground/coding/h/${encodeURIComponent(playgroundHash)}/latest_submission/`;
+  return basePath;
+}
+
+function buildSubmitPath(playgroundHash: string, playgroundKind: PlaygroundKind): string {
+  return `${buildPlaygroundPath(playgroundHash, playgroundKind)}?run_hidden_test_cases=true`;
 }
 
 async function fetchPlaygroundByHash(
   client: AxiosInstance,
-  playgroundHash: string
-): Promise<Record<string, unknown>> {
-  const response = await withRetry(() =>
-    client.get(`/api/v1/playground/coding/h/${encodeURIComponent(playgroundHash)}/`)
-  );
-  if (!isObject(response.data)) {
-    throw new Error("Unexpected playground response from Newton API");
+  playgroundHash: string,
+  preferredKinds: PlaygroundKind[] = []
+): Promise<{ playground: Record<string, unknown>; playgroundKind: PlaygroundKind }> {
+  const candidates = buildPlaygroundKindCandidates(preferredKinds);
+  let lastMiss: unknown;
+
+  for (const playgroundKind of candidates) {
+    try {
+      const response = await withRetry(
+        () => client.get(buildPlaygroundPath(playgroundHash, playgroundKind)),
+        2,
+        400,
+        (err) => !isPlaygroundKindMiss(err)
+      );
+      if (!isObject(response.data)) {
+        throw new Error("Unexpected playground response from Newton API");
+      }
+      return { playground: response.data, playgroundKind };
+    } catch (err) {
+      if (isPlaygroundKindMiss(err)) {
+        lastMiss = err;
+        continue;
+      }
+      throw err;
+    }
   }
-  return response.data;
+
+  if (lastMiss) throw lastMiss;
+  throw new Error(`Unable to fetch playground '${playgroundHash}'.`);
 }
 
 async function listAssignmentsRaw(
@@ -332,6 +525,33 @@ async function listAssignmentsRaw(
     )
   );
   return normalizeAssignments(response.data);
+}
+
+function extractSubjectHashFromAssignment(
+  assignment?: Record<string, unknown>
+): string | undefined {
+  if (!assignment) return undefined;
+  const course = isObject(assignment.course) ? assignment.course : undefined;
+  const subject = isObject(assignment.subject) ? assignment.subject : undefined;
+
+  return firstString(
+    assignment.subject_hash,
+    assignment.course_hash,
+    course?.subject_hash,
+    course?.hash,
+    subject?.hash
+  );
+}
+
+async function findAssignmentByHash(
+  client: AxiosInstance,
+  courseHash: string,
+  assignmentHash: string
+): Promise<Record<string, unknown> | undefined> {
+  const assignments = await listAssignmentsRaw(client, courseHash);
+  return assignments.find(
+    (assignment) => firstString(assignment.hash, assignment.assignment_hash) === assignmentHash
+  );
 }
 
 async function resolveAssignmentForQuestionHash(
@@ -350,25 +570,54 @@ async function resolveAssignmentForQuestionHash(
 async function fetchAssignmentQuestionDetails(
   client: AxiosInstance,
   params: {
-    courseHash: string;
+    courseHashCandidates: string[];
     assignmentHash: string;
     questionHash: string;
   }
-): Promise<Record<string, unknown>> {
-  const { courseHash, assignmentHash, questionHash } = params;
-  const response = await withRetry(() =>
-    client.get(
-      `/api/v1/course/h/${encodeURIComponent(
-        courseHash
-      )}/assignment/h/${encodeURIComponent(
-        assignmentHash
-      )}/question/h/${encodeURIComponent(questionHash)}/details/`
-    )
-  );
-  if (!isObject(response.data)) {
-    throw new Error("Unexpected assignment question details response from Newton API");
+): Promise<{ details: Record<string, unknown>; resolvedCourseHash: string }> {
+  const { courseHashCandidates, assignmentHash, questionHash } = params;
+  const candidates = uniqueStrings(courseHashCandidates);
+  if (!candidates.length) {
+    throw new Error("Missing course/subject hash while resolving assignment question details.");
   }
-  return response.data;
+
+  let lastMiss: unknown;
+  for (const courseHash of candidates) {
+    try {
+      const response = await withRetry(
+        () =>
+          client.get(
+            `/api/v1/course/h/${encodeURIComponent(
+              courseHash
+            )}/assignment/h/${encodeURIComponent(
+              assignmentHash
+            )}/question/h/${encodeURIComponent(questionHash)}/details/`
+          ),
+        2,
+        400,
+        (err) => {
+          if (!axios.isAxiosError(err)) return true;
+          const status = err.response?.status;
+          if (!status) return true;
+          if (status === 429 || status >= 500) return true;
+          return false;
+        }
+      );
+      if (!isObject(response.data)) {
+        throw new Error("Unexpected assignment question details response from Newton API");
+      }
+      return { details: response.data, resolvedCourseHash: courseHash };
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        lastMiss = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (lastMiss) throw lastMiss;
+  throw new Error("Unable to fetch assignment question details from Newton API.");
 }
 
 async function resolvePlayground(
@@ -377,8 +626,10 @@ async function resolvePlayground(
     problemId: string;
     courseHash?: string;
     assignmentHash?: string;
+    preferredPlaygroundKind?: PlaygroundKind;
   }
 ): Promise<{
+  playgroundKind: PlaygroundKind;
   playgroundHash: string;
   courseHash?: string;
   assignmentHash?: string;
@@ -387,52 +638,63 @@ async function resolvePlayground(
 }> {
   const parsed = parseProblemRef(params.problemId);
   const requestedHash = parsed.questionOrPlaygroundHash;
-  const courseHash = params.courseHash ?? parsed.courseHash ?? getDefaultCourseHash();
+  const courseHashInput = params.courseHash ?? parsed.courseHash ?? getDefaultCourseHash();
   const assignmentHashInput = params.assignmentHash ?? parsed.assignmentHash;
+  const preferredKinds = params.preferredPlaygroundKind
+    ? [params.preferredPlaygroundKind]
+    : [];
 
   try {
-    const playground = await fetchPlaygroundByHash(client, requestedHash);
+    const fetched = await fetchPlaygroundByHash(client, requestedHash, preferredKinds);
     const resolvedPlaygroundHash =
-      firstString(playground.hash, requestedHash) ?? requestedHash;
+      firstString(fetched.playground.hash, requestedHash) ?? requestedHash;
     return {
+      playgroundKind: fetched.playgroundKind,
       playgroundHash: resolvedPlaygroundHash,
-      courseHash,
+      courseHash: courseHashInput,
       assignmentHash: assignmentHashInput,
-      playground,
+      playground: fetched.playground,
     };
   } catch (err) {
-    if (!axios.isAxiosError(err) || err.response?.status !== 404) {
+    if (!isPlaygroundKindMiss(err)) {
       throw normalizeError(err);
     }
   }
 
-  if (!courseHash) {
+  if (!courseHashInput) {
     throw new Error(
       "Could not resolve problemId as playground hash. Provide courseHash (or set NEWTON_COURSE_HASH) to resolve assignment question hashes."
     );
   }
 
   let assignmentHash = assignmentHashInput;
+  let assignment: Record<string, unknown> | undefined;
   if (!assignmentHash) {
-    const assignment = await resolveAssignmentForQuestionHash(
+    assignment = await resolveAssignmentForQuestionHash(
       client,
-      courseHash,
+      courseHashInput,
       requestedHash
     );
     assignmentHash = firstString(assignment?.hash);
+  } else {
+    assignment = await findAssignmentByHash(client, courseHashInput, assignmentHash);
   }
 
   if (!assignmentHash) {
     throw new Error(
-      `Unable to find assignment for question hash '${requestedHash}' in course '${courseHash}'.`
+      `Unable to find assignment for question hash '${requestedHash}' in course '${courseHashInput}'.`
     );
   }
 
-  const questionDetails = await fetchAssignmentQuestionDetails(client, {
-    courseHash,
+  const questionDetailsResult = await fetchAssignmentQuestionDetails(client, {
+    courseHashCandidates: uniqueStrings([
+      extractSubjectHashFromAssignment(assignment),
+      courseHashInput,
+    ]),
     assignmentHash,
     questionHash: requestedHash,
   });
+  const questionDetails = questionDetailsResult.details;
   const playgroundHash = firstString(
     questionDetails.hash,
     questionDetails.playground_hash,
@@ -442,13 +704,18 @@ async function resolvePlayground(
     throw new Error("Newton API did not provide playground hash for assignment question");
   }
 
-  const playground = await fetchPlaygroundByHash(client, playgroundHash);
+  const hintedKinds = uniquePlaygroundKinds([
+    ...preferredKinds,
+    ...extractPlaygroundKindHints(questionDetails),
+  ]);
+  const fetched = await fetchPlaygroundByHash(client, playgroundHash, hintedKinds);
   return {
+    playgroundKind: fetched.playgroundKind,
     playgroundHash,
-    courseHash,
+    courseHash: questionDetailsResult.resolvedCourseHash,
     assignmentHash,
     assignmentQuestionHash: requestedHash,
-    playground,
+    playground: fetched.playground,
   };
 }
 
@@ -473,11 +740,18 @@ function collectLanguageMappings(playground: Record<string, unknown>): Array<Rec
   return mappings;
 }
 
-function resolveLanguageId(playground: Record<string, unknown>, language: string): number {
+function resolveLanguageId(
+  playground: Record<string, unknown>,
+  language: string,
+  options?: { allowMissing?: boolean }
+): number | undefined {
   const directNumeric = maybeNumber(language);
   if (directNumeric !== undefined) return directNumeric;
 
   const target = language.trim().toLowerCase();
+  if (!target && options?.allowMissing) return undefined;
+  if (!target) throw new Error("language cannot be empty");
+
   const aliases: Record<string, string[]> = {
     javascript: ["javascript", "js", "node", "nodejs"],
     typescript: ["typescript", "ts"],
@@ -529,6 +803,8 @@ function resolveLanguageId(playground: Record<string, unknown>, language: string
   const existing = maybeNumber(playground.language_id);
   if (existing !== undefined) return existing;
 
+  if (options?.allowMissing) return undefined;
+
   throw new Error(
     `Unable to map language '${language}' to Newton language_id for this problem. Pass numeric language id instead.`
   );
@@ -536,36 +812,117 @@ function resolveLanguageId(playground: Record<string, unknown>, language: string
 
 async function fetchLatestSubmissionRaw(
   client: AxiosInstance,
-  playgroundHash: string
-): Promise<Record<string, unknown>> {
-  const response = await withRetry(() => client.get(buildLatestSubmissionPath(playgroundHash)));
-  if (!isObject(response.data)) {
-    throw new Error("Unexpected latest_submission response from Newton API");
+  playgroundHash: string,
+  preferredKinds: PlaygroundKind[] = []
+): Promise<{ latestSubmission: Record<string, unknown>; playgroundKind: PlaygroundKind }> {
+  const candidates = buildPlaygroundKindCandidates(preferredKinds);
+  let lastMiss: unknown;
+
+  for (const playgroundKind of candidates) {
+    try {
+      const response = await withRetry(
+        () => client.get(buildLatestSubmissionPath(playgroundHash, playgroundKind)),
+        2,
+        400,
+        (err) => !isPlaygroundKindMiss(err)
+      );
+      if (!isObject(response.data)) {
+        throw new Error("Unexpected latest_submission response from Newton API");
+      }
+      if (playgroundKind === "project" && Object.keys(response.data).length === 0) {
+        const playgroundResponse = await withRetry(
+          () => client.get(buildPlaygroundPath(playgroundHash, playgroundKind)),
+          2,
+          400,
+          (err) => !isPlaygroundKindMiss(err)
+        );
+        if (isObject(playgroundResponse.data)) {
+          return { latestSubmission: playgroundResponse.data, playgroundKind };
+        }
+      }
+      return { latestSubmission: response.data, playgroundKind };
+    } catch (err) {
+      if (isPlaygroundKindMiss(err)) {
+        lastMiss = err;
+        continue;
+      }
+      throw err;
+    }
   }
-  return response.data;
+
+  if (lastMiss) throw lastMiss;
+  throw new Error(`Unable to fetch latest submission for playground '${playgroundHash}'.`);
+}
+
+async function submitPlaygroundCode(
+  client: AxiosInstance,
+  playgroundHash: string,
+  payload: Record<string, unknown>,
+  preferredKinds: PlaygroundKind[] = []
+): Promise<PlaygroundKind> {
+  const candidates = buildPlaygroundKindCandidates(preferredKinds);
+  let lastMiss: unknown;
+
+  for (const playgroundKind of candidates) {
+    try {
+      await withRetry(
+        () => client.patch(buildSubmitPath(playgroundHash, playgroundKind), payload),
+        2,
+        400,
+        (err) => !isPlaygroundKindMiss(err)
+      );
+      return playgroundKind;
+    } catch (err) {
+      if (isPlaygroundKindMiss(err)) {
+        lastMiss = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (lastMiss) throw lastMiss;
+  throw new Error(`Unable to submit to playground '${playgroundHash}'.`);
 }
 
 async function pollLatestSubmission(
   client: AxiosInstance,
-  playgroundHash: string
-): Promise<Record<string, unknown>> {
+  playgroundHash: string,
+  preferredKind?: PlaygroundKind
+): Promise<{ latestSubmission: Record<string, unknown>; playgroundKind: PlaygroundKind }> {
   const maxAttempts = maybeNumber(process.env.NEWTON_SUBMIT_POLL_ATTEMPTS) ??
     DEFAULT_SUBMIT_POLL_ATTEMPTS;
   const intervalMs = maybeNumber(process.env.NEWTON_SUBMIT_POLL_INTERVAL_MS) ??
     DEFAULT_SUBMIT_POLL_INTERVAL_MS;
 
   let latest: Record<string, unknown> = {};
+  let activeKind = preferredKind;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    latest = await fetchLatestSubmissionRaw(client, playgroundHash);
-    if (!isPendingBuild(latest)) return latest;
+    const fetched = await fetchLatestSubmissionRaw(
+      client,
+      playgroundHash,
+      activeKind ? [activeKind] : []
+    );
+    latest = fetched.latestSubmission;
+    activeKind = fetched.playgroundKind;
+    if (!isPendingBuild(latest)) {
+      return {
+        latestSubmission: latest,
+        playgroundKind: activeKind,
+      };
+    }
     await new Promise((res) => setTimeout(res, intervalMs));
   }
-  return latest;
+  return {
+    latestSubmission: latest,
+    playgroundKind: activeKind ?? "coding",
+  };
 }
 
 function encodeSubmissionId(
   playgroundHash: string,
-  latestSubmission: Record<string, unknown>
+  latestSubmission: Record<string, unknown>,
+  playgroundKind: PlaygroundKind
 ): string {
   const submissionHash =
     firstString(
@@ -574,16 +931,25 @@ function encodeSubmissionId(
       latestSubmission.id,
       latestSubmission.token
     ) ?? "latest";
-  return `${playgroundHash}:${submissionHash}`;
+  const playgroundRef = playgroundKind === "coding"
+    ? playgroundHash
+    : `${playgroundKind}/${playgroundHash}`;
+  return `${playgroundRef}:${submissionHash}`;
 }
 
-async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 400): Promise<T> {
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  retries = 2,
+  delayMs = 400,
+  shouldRetry?: (err: unknown) => boolean
+): Promise<T> {
   try {
     return await fn();
   } catch (err) {
+    if (shouldRetry && !shouldRetry(err)) throw err;
     if (retries <= 0) throw err;
     await new Promise((res) => setTimeout(res, delayMs));
-    return withRetry(fn, retries - 1, delayMs * 2);
+    return withRetry(fn, retries - 1, delayMs * 2, shouldRetry);
   }
 }
 
@@ -591,7 +957,7 @@ function normalizeError(err: unknown): Error {
   if (axios.isAxiosError(err)) {
     const axErr = err as AxiosError;
     if (axErr.response?.status === 401) {
-      return new Error("Unauthorized: Newton session is invalid or expired");
+      return new Error("Unauthorized: Newton session is invalid or expired. Run auth_login and retry.");
     }
     const status = axErr.response?.status;
     const message =
@@ -605,10 +971,10 @@ function normalizeError(err: unknown): Error {
 
 export async function fetchProblem(
   problemId: string,
-  options?: { courseHash?: string; assignmentHash?: string }
+  options?: { courseHash?: string; assignmentHash?: string; auth?: NewtonAuthInput }
 ): Promise<Problem> {
   try {
-    const client = createClient();
+    const client = createClient(options?.auth);
     const resolved = await resolvePlayground(client, {
       problemId,
       courseHash: options?.courseHash,
@@ -621,10 +987,11 @@ export async function fetchProblem(
 }
 
 export async function listAssignmentQuestions(
-  courseHashInput?: string
+  courseHashInput?: string,
+  options?: { auth?: NewtonAuthInput }
 ): Promise<AssignmentQuestionRef[]> {
   try {
-    const client = createClient();
+    const client = createClient(options?.auth);
     const courseHash = courseHashInput ?? getDefaultCourseHash();
     if (!courseHash) {
       throw new Error(
@@ -643,56 +1010,106 @@ export async function submitSolution(
   problemId: string,
   language: string,
   code: string,
-  options?: { courseHash?: string; assignmentHash?: string }
+  options?: {
+    courseHash?: string;
+    assignmentHash?: string;
+    playgroundType?: string;
+    auth?: NewtonAuthInput;
+  }
 ): Promise<SubmissionResponse> {
   try {
-    const client = createClient();
+    const client = createClient(options?.auth);
+    const preferredPlaygroundKind = normalizePlaygroundKind(options?.playgroundType);
     const resolved = await resolvePlayground(client, {
       problemId,
       courseHash: options?.courseHash,
       assignmentHash: options?.assignmentHash,
+      preferredPlaygroundKind,
     });
-    const languageId = resolveLanguageId(resolved.playground, language);
+    const isCodingPlayground = resolved.playgroundKind === "coding";
+    const languageId = resolveLanguageId(resolved.playground, language, {
+      allowMissing: !isCodingPlayground,
+    });
 
     const payload: Record<string, unknown> = {
       hash: resolved.playgroundHash,
-      language_id: languageId,
       source_code: code,
       run_hidden_test: true,
       showSubmissionTab: true,
       is_force_save: true,
     };
+    if (languageId !== undefined) {
+      payload.language_id = languageId;
+    }
+    if (!isCodingPlayground) {
+      payload.code = code;
+      payload.sourceCode = code;
+      const files = maybeJsonObject(code);
+      if (files) {
+        payload.files = files;
+        payload.project_files = files;
+      }
+    }
+
     const lastSavedAt = firstString(resolved.playground.last_saved_at);
     if (lastSavedAt) {
       payload.last_saved_at = lastSavedAt;
     }
 
-    await withRetry(() =>
-      client.patch(
-        `/api/v1/playground/coding/h/${encodeURIComponent(
-          resolved.playgroundHash
-        )}/?run_hidden_test_cases=true`,
-        payload
-      )
+    const submitKind = await submitPlaygroundCode(
+      client,
+      resolved.playgroundHash,
+      payload,
+      uniquePlaygroundKinds([
+        preferredPlaygroundKind,
+        resolved.playgroundKind,
+        ...extractPlaygroundKindHints(resolved.playground),
+      ])
     );
 
-    const latest = await pollLatestSubmission(client, resolved.playgroundHash);
+    const polled = await pollLatestSubmission(client, resolved.playgroundHash, submitKind);
     return {
-      submissionId: encodeSubmissionId(resolved.playgroundHash, latest),
+      submissionId: encodeSubmissionId(
+        resolved.playgroundHash,
+        polled.latestSubmission,
+        polled.playgroundKind
+      ),
       playgroundHash: resolved.playgroundHash,
-      raw: latest,
+      raw: polled.latestSubmission,
     };
   } catch (err) {
     throw normalizeError(err);
   }
 }
 
-export async function getSubmissionStatus(submissionId: string): Promise<SubmissionStatus> {
+export async function getSubmissionStatus(
+  submissionId: string,
+  options?: { auth?: NewtonAuthInput }
+): Promise<SubmissionStatus> {
   try {
-    const client = createClient();
-    const { playgroundHash } = parseSubmissionRef(submissionId);
-    const latest = await fetchLatestSubmissionRaw(client, playgroundHash);
-    return normalizeSubmissionStatus(latest);
+    const client = createClient(options?.auth);
+    const { playgroundHash, playgroundKind } = parseSubmissionRef(submissionId);
+    const latest = await fetchLatestSubmissionRaw(
+      client,
+      playgroundHash,
+      playgroundKind ? [playgroundKind] : []
+    );
+    return normalizeSubmissionStatus(latest.latestSubmission);
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}
+
+export async function getCurrentUser(
+  options?: { auth?: NewtonAuthInput }
+): Promise<Record<string, unknown>> {
+  try {
+    const client = createClient(options?.auth);
+    const response = await withRetry(() => client.get("/api/v1/user/me/"));
+    if (!isObject(response.data)) {
+      throw new Error("Unexpected user response from Newton API");
+    }
+    return response.data;
   } catch (err) {
     throw normalizeError(err);
   }
