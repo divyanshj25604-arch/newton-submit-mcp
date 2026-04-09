@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: newton-submit-mcp
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: MCP_MODE
+        value: http
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 3000
+      - key: MCP_API_KEY
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: NEWTON_COURSE_HASH
+        sync: false
